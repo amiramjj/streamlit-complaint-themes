@@ -44,12 +44,14 @@ def call_gemini(system_instruction: str, complaint_text: str):
         "response_schema": {
             "type": "object",
             "properties": {
-                "all_case_themes": {"type": "array", "items": {"type": "string"}},
-                "case_theme": {"type": "string"}
+                "all_case_themes":      {"type": "array", "items": {"type": "string"}},
+                "subcategory_themes":   {"type": "array", "items": {"type": "string"}}
             },
-            "required": ["all_case_themes"]
+            "required": ["all_case_themes", "subcategory_themes"],
+            "additionalProperties": False   # <- disallow extra fields like case_theme
         }
     }
+
     resp = model.generate_content(
         [{"role": "user", "parts": [f'complaint_summary: """{complaint_text}"""']}],
         generation_config=generation_config,
