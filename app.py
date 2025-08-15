@@ -18,6 +18,10 @@ st.write("Model:", st.secrets.get("MODEL_NAME"))
 
 
 # ---------- Gemini test (single row) ----------
+import json
+import streamlit as st
+import google.generativeai as genai
+
 st.header("Gemini test (single row)")
 
 # 1) Check secret
@@ -36,7 +40,7 @@ go = st.button("Test Gemini")
 
 def call_gemini(system_instruction: str, complaint_text: str):
     """
-    Calls Gemini and expects STRICT JSON with:
+    Expects STRICT JSON with:
       {
         "all_case_themes": [string, ...],
         "subcategory_themes": [string, ...]
@@ -54,8 +58,8 @@ def call_gemini(system_instruction: str, complaint_text: str):
                 "all_case_themes":    {"type": "array", "items": {"type": "string"}},
                 "subcategory_themes": {"type": "array", "items": {"type": "string"}}
             },
-            "required": ["all_case_themes", "subcategory_themes"],
-            "additionalProperties": False  # disallow extra fields like 'case_theme'
+            "required": ["all_case_themes", "subcategory_themes"]
+            # NOTE: no 'additionalProperties' — Gemini doesn't support that field
         }
     }
 
@@ -71,6 +75,12 @@ def call_gemini(system_instruction: str, complaint_text: str):
         raw_text = "".join(getattr(p, "text", "") for p in parts)
 
     data = json.loads(raw_text or "{}")
+
+    # Keep only the keys we care about (ignore any extras)
+    data = {
+        "all_case_themes": data.get("all_case_themes", []),
+        "subcategory_themes": data.get("subcategory_themes", [])
+    }
     return data, raw_text
 
 if go:
@@ -86,6 +96,7 @@ if go:
         st.error(f"Failed to parse JSON: {e}")
         if 'raw' in locals() and raw:
             st.code(raw)
+
 
 # ---------- Batch setup: upload & select column (robust) ----------
 import pandas as pd
