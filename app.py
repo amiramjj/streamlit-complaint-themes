@@ -6,3 +6,7 @@ st.title("Complaint Themes Extractor")
 st.caption("Step 1: Skeleton app — we’ll add upload & extraction next.")
 
 st.success("If you can see this message after deployment, the app is wired up.")
+
+import streamlit as st
+st.write("Key loaded:", "GOOGLE_API_KEY" in st.secrets)
+st.write("Model:", st.secrets.get("MODEL_NAME"))
