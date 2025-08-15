@@ -216,8 +216,8 @@ if uploaded is not None:
 else:
     st.caption("Upload a CSV or Excel file to continue.")
 
-# ---------- Batch extraction: run + export ----------
-import time
+# ---------- Batch extraction — run & export (with summarize-on-error fallback) ----------
+import time, json
 import pandas as pd
 import streamlit as st
 
@@ -229,7 +229,7 @@ text_col = st.session_state.get("text_col")
 if df is None or text_col is None:
     st.caption("Upload a file and select the text column above to enable batch extraction.")
 else:
-    col1, col2 = st.columns([1,1])
+    col1, col2 = st.columns([1, 1])
     with col1:
         skip_no_complaint = st.checkbox("Skip rows where text equals 'no complaint'", value=True)
     with col2:
@@ -248,6 +248,8 @@ else:
         work = df.copy()
         work["row_id"] = range(len(work))
         col_series = work[text_col].astype(str)
+
+        # Valid rows: non-empty; optionally exclude literal "no complaint"
         valid = col_series.str.strip().ne("")
         if skip_no_complaint:
             valid &= col_series.str.strip().str.lower().ne("no complaint")
@@ -263,33 +265,52 @@ else:
 
         for k, i in enumerate(idx, start=1):
             txt = str(work.at[i, text_col]).strip()
-            # retry/backoff
-            attempts = 0
-            while True:
-                try:
-                    out = call_gemini(system_prompt.strip(), txt)
-                    themes = out.get("all_case_themes", [])
-                    break
-                except Exception:
-                    attempts += 1
-                    if attempts >= 5:
-                        themes = []
-                        st.warning(f"Row {work.at[i,'row_id']} failed after retries. Saved empty list.")
-                        break
-                    time.sleep(min(2**attempts, 10))
 
-            results.append({"row_id": work.at[i, "row_id"], "all_case_themes": themes})
+            # Try primary extractor first; on error, summarize then extract
+            try:
+                out, _raw = call_gemini_extract(system_prompt.strip(), txt)
+            except Exception:
+                try:
+                    summary = call_gemini_summarize(txt)
+                    out, _raw2 = call_gemini_extract(system_prompt.strip(), summary or txt)
+                except Exception:
+                    # Final fallback: empty payload
+                    out = {
+                        "all_case_themes": [],
+                        "subcategory_themes": [],
+                        "evidence_spans": []
+                    }
+
+            results.append({
+                "row_id": int(work.at[i, "row_id"]),
+                "all_case_themes": out.get("all_case_themes", []),
+                "subcategory_themes": out.get("subcategory_themes", []),
+                "evidence_spans": out.get("evidence_spans", []),
+            })
+
             prog.progress(k / len(idx))
             status.write(f"Processed {k}/{len(idx)}")
 
+        # Assemble ordered output
         out_df = pd.DataFrame(results).sort_values("row_id")
+
         st.subheader("Sample of results")
         st.dataframe(out_df.head(20), use_container_width=True)
 
-        csv_bytes = out_df[["row_id", "all_case_themes"]].to_csv(index=False).encode("utf-8")
-        st.download_button("Download themes CSV", data=csv_bytes,
-                           file_name="all_case_themes.csv", mime="text/csv")
-        st.info(f"Export ready. Source rows: {len(work)} • Labeled rows: {len(out_df)} (ordered by row_id).")
+        # Convert list / list-of-dicts to JSON strings for a clean CSV
+        csv_df = out_df.copy()
+        for col in ["all_case_themes", "subcategory_themes", "evidence_spans"]:
+            csv_df[col] = csv_df[col].apply(lambda x: json.dumps(x, ensure_ascii=False))
 
+        csv_bytes = csv_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download themes CSV",
+            data=csv_bytes,
+            file_name="themes_with_subcats_and_evidence.csv",
+            mime="text/csv"
+        )
 
-
+        st.info(
+            f"Export ready. Source rows: {len(work)} • Labeled rows: {len(out_df)} "
+            "(ordered by row_id)."
+        )
