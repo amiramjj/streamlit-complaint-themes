@@ -443,48 +443,56 @@ else:
                 mime="text/csv"
             )
 
-    # Optional: retry only empty rows (runs summarize-then-extract again)
-    retry_empty = st.button("Retry empty rows (fallback again)")
-    if retry_empty and st.session_state.get("last_results") is not None:
-        out_df = st.session_state["last_results"].copy()
-        empties = out_df.index[
-            (out_df["all_case_themes"].apply(lambda x: len(x)==0)) &
-            (out_df["subcategory_themes"].apply(lambda x: len(x)==0)) &
-            (out_df["evidence_spans"].apply(lambda x: len(x)==0))
-        ]
-    
-        if len(empties) == 0:
-            st.success("No empty rows to retry.")
-        else:
-            st.write(f"Retrying {len(empties)} empty rows…")
-            for j in empties:
-                base = out_df.loc[j, "complaint_excerpt"]
-                raw_trunc = base[:5000]
-    
-                # Try gentle clean first on retry
-                cleaned = gentle_clean_soft(raw_trunc)
-                try:
-                    out2, _ = call_gemini_extract(system_prompt.strip(), cleaned or raw_trunc)
-                except Exception:
-                    out2 = {"all_case_themes": [], "subcategory_themes": [], "evidence_spans": []}
-    
-                # If still empty, summarize raw and extract
-                if is_empty_output(out2):
-                    try:
-                        summary = call_gemini_summarize(raw_trunc)
-                        out3, _ = call_gemini_extract(system_prompt.strip(), summary or raw_trunc)
-                        if not is_empty_output(out3):
-                            out2 = out3
-                    except Exception:
-                        pass
-    
-                if not is_empty_output(out2):
-                    out_df.at[j, "all_case_themes"] = out2.get("all_case_themes", [])
-                    out_df.at[j, "subcategory_themes"] = out2.get("subcategory_themes", [])
-                    out_df.at[j, "evidence_spans"] = out2.get("evidence_spans", [])
-                    out_df.at[j, "used_cleaning"] = True  # this retry tried cleaning/summary
-                    out_df.at[j, "used_summary"] = out_df.at[j, "used_summary"] or (is_empty_output(out2) == False)
-    
-            st.session_state["last_results"] = out_df
-            st.success("Retry pass completed.")
-            st.dataframe(out_df.head(20), use_container_width=True)
+    # ---------- Retry only empty rows (summary → extract) ----------
+retry_empty = st.button("Retry empty rows (summarize then extract)")
+if retry_empty and st.session_state.get("last_results") is not None:
+    out_df = st.session_state["last_results"].copy()
+    orig_df = st.session_state["orig_df"]
+    tcol = st.session_state["orig_text_col"]
+
+    # find indexes (not just row_ids) of empties
+    empties_idx = out_df.index[
+        (out_df["all_case_themes"].apply(lambda x: len(x) == 0)) &
+        (out_df["subcategory_themes"].apply(lambda x: len(x) == 0)) &
+        (out_df["evidence_spans"].apply(lambda x: len(x) == 0))
+    ].tolist()
+
+    if not empties_idx:
+        st.success("No empty rows to retry.")
+    else:
+        st.write(f"Retrying {len(empties_idx)} empty row(s)…")
+        for idx in empties_idx:
+            rid = int(out_df.at[idx, "row_id"])
+            raw_txt = str(orig_df.iloc[rid][tcol]).strip()
+            raw_trunc = raw_txt[:5000]
+
+            try:
+                summary = call_gemini_summarize(raw_trunc)  # summarize RAW
+                out, _ = call_gemini_extract(st.session_state["system_prompt"].strip(), summary or raw_trunc)
+            except Exception:
+                out = {"all_case_themes": [], "subcategory_themes": [], "evidence_spans": []}
+
+            # Assign per row using .at to avoid shape/broadcast issues
+            out_df.at[idx, "all_case_themes"] = out.get("all_case_themes", [])
+            out_df.at[idx, "subcategory_themes"] = out.get("subcategory_themes", [])
+            out_df.at[idx, "evidence_spans"] = out.get("evidence_spans", [])
+            out_df.at[idx, "used_summary"] = True
+
+        st.session_state["last_results"] = out_df
+
+        st.success("Retry pass completed.")
+        st.subheader("Updated sample")
+        st.dataframe(out_df.head(20), use_container_width=True)
+
+        # Fresh download after retry
+        csv_df = out_df.copy()
+        import json
+        for col in ["all_case_themes", "subcategory_themes", "evidence_spans"]:
+            csv_df[col] = csv_df[col].apply(lambda x: json.dumps(x, ensure_ascii=False))
+        csv_bytes = csv_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download updated CSV",
+            data=csv_bytes,
+            file_name="themes_with_subcats_and_evidence_updated.csv",
+            mime="text/csv"
+        )
