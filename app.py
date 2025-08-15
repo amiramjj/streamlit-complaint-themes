@@ -2,6 +2,8 @@ import streamlit as st
 import json, os
 import streamlit as st
 import google.generativeai as genai
+import io
+import pandas as pd
 
 st.set_page_config(page_title="Complaint Themes Extractor", layout="centered")
 
@@ -71,3 +73,34 @@ if go:
             st.code(resp.text)  # may not exist if exception happened earlier
         except:
             pass
+
+# ---------- Batch setup: upload & select column ----------
+st.header("Batch extraction — upload & select column")
+
+uploaded = st.file_uploader("Upload CSV with a complaint text column", type=["csv"])
+if uploaded is not None:
+    # Read CSV
+    df = pd.read_csv(uploaded)
+    st.write(f"Rows: {len(df):,} • Columns: {list(df.columns)}")
+
+    # Choose the text column (default to 'complaint_summary' if present)
+    default_col = "complaint_summary" if "complaint_summary" in df.columns else None
+    text_col = st.selectbox(
+        "Which column contains the complaint text?",
+        options=list(df.columns),
+        index=(list(df.columns).index(default_col) if default_col in df.columns else 0)
+    )
+
+    # Basic cleaning / checks
+    work = df.copy()
+    work["row_id"] = range(len(work))  # preserve original order
+    missing = work[text_col].isna().sum()
+    st.info(f"Selected text column: **{text_col}** • Missing values: **{missing}**")
+
+    # Show a preview of what will be processed
+    st.subheader("Preview (first 10 rows)")
+    st.dataframe(work[["row_id", text_col]].head(10), use_container_width=True)
+
+    st.caption("Looks good? In the next step we’ll add the Run button, progress bar, and CSV export.")
+else:
+    st.caption("Upload a CSV to continue.")
