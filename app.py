@@ -17,6 +17,7 @@ st.write("Key loaded:", "GOOGLE_API_KEY" in st.secrets)
 st.write("Model:", st.secrets.get("MODEL_NAME"))
 
 
+# ---------- Gemini test (single row) ----------
 st.header("Gemini test (single row)")
 
 # 1) Check secret
@@ -26,56 +27,65 @@ if "GOOGLE_API_KEY" not in st.secrets:
 
 # 2) Configure SDK
 genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-model_name = st.secrets.get("MODEL_NAME", "gemini-2.5-flash-lite")
+MODEL_NAME = st.secrets.get("MODEL_NAME", "gemini-2.5-flash-lite")
 
 # 3) Inputs
-system_prompt = st.text_area("System instruction (paste yours here)", height=200)
-sample_text = st.text_area("One complaint_summary to test", height=100)
+system_prompt = st.text_area("System instruction (paste yours here)", height=220, value=st.session_state.get("system_prompt", ""))
+sample_text  = st.text_area("One complaint_summary to test", height=120, value=st.session_state.get("sample_text", ""))
 go = st.button("Test Gemini")
 
 def call_gemini(system_instruction: str, complaint_text: str):
+    """
+    Calls Gemini and expects STRICT JSON with:
+      {
+        "all_case_themes": [string, ...],
+        "subcategory_themes": [string, ...]
+      }
+    """
     model = genai.GenerativeModel(
-        model_name=model_name,
+        model_name=MODEL_NAME,
         system_instruction=system_instruction
     )
-    # Ask for strict JSON with only the fields we need
     generation_config = {
         "response_mime_type": "application/json",
         "response_schema": {
             "type": "object",
             "properties": {
-                "all_case_themes":      {"type": "array", "items": {"type": "string"}},
-                "subcategory_themes":   {"type": "array", "items": {"type": "string"}}
+                "all_case_themes":    {"type": "array", "items": {"type": "string"}},
+                "subcategory_themes": {"type": "array", "items": {"type": "string"}}
             },
             "required": ["all_case_themes", "subcategory_themes"],
-            "additionalProperties": False   # <- disallow extra fields like case_theme
+            "additionalProperties": False  # disallow extra fields like 'case_theme'
         }
     }
 
     resp = model.generate_content(
         [{"role": "user", "parts": [f'complaint_summary: """{complaint_text}"""']}],
         generation_config=generation_config,
-        safety_settings=None,
     )
+
     # Prefer resp.text; fall back to parts if needed
-    text = getattr(resp, "text", None)
-    if not text and resp.candidates:
+    raw_text = getattr(resp, "text", None)
+    if not raw_text and getattr(resp, "candidates", None):
         parts = resp.candidates[0].content.parts
-        text = "".join(getattr(p, "text", "") for p in parts)
-    return json.loads(text)
+        raw_text = "".join(getattr(p, "text", "") for p in parts)
+
+    data = json.loads(raw_text or "{}")
+    return data, raw_text
 
 if go:
+    # remember inputs between reruns
+    st.session_state["system_prompt"] = system_prompt
+    st.session_state["sample_text"]  = sample_text
+
     try:
-        out = call_gemini(system_prompt.strip(), sample_text.strip())
+        out, raw = call_gemini(system_prompt.strip(), sample_text.strip())
         st.success("Got JSON:")
         st.json(out)
     except Exception as e:
         st.error(f"Failed to parse JSON: {e}")
-        st.write("Raw response for debugging:")
-        try:
-            st.code(resp.text)  # may not exist if exception happened earlier
-        except:
-            pass
+        if 'raw' in locals() and raw:
+            st.code(raw)
 
 # ---------- Batch setup: upload & select column (robust) ----------
 import pandas as pd
