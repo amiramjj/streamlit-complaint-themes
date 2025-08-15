@@ -218,57 +218,46 @@ else:
     st.caption("Upload a CSV or Excel file to continue.")
 
 
-# ---------- Helpers: gentle cleaning & empty-output check ----------
+
+# ---------- Helpers: very gentle cleaning & empty-output check ----------
 import re
 
-KEEP_PREFIXES = ("disclaimer:", "full summary:", "recent summary:", "summary:", "note:")
+PREFIXES = ("disclaimer:", "full summary:", "recent summary:", "summary:", "note:")
 
-def gentle_clean(text: str, max_chars: int = 2500):
+def gentle_clean_soft(text: str, max_chars: int = 3000) -> str:
     """
-    Keep signal; remove only obvious admin noise.
-    Returns (cleaned_text, raw_truncated_text).
+    Super minimal cleaning:
+      - remove URLs
+      - strip known prefixes (keep rest of the line)
+      - collapse whitespace
+      - trim to max_chars
+    Used only if primary extraction errors or returns empty.
     """
     if not isinstance(text, str):
-        return "", ""
-    raw = text.strip()
-    # truncate raw early (we may need it)
-    raw_trunc = raw[: max_chars * 2]
+        return ""
+    # remove URLs anywhere
+    no_urls = re.sub(r"https?://\S+|www\.\S+", "", text, flags=re.IGNORECASE)
 
-    # strip URLs
-    no_urls = re.sub(r"https?://\S+|www\.\S+", "", raw_trunc, flags=re.IGNORECASE)
-
-    lines = []
+    # strip label prefixes, KEEP content
+    processed = []
     for line in no_urls.splitlines():
         l = line.strip()
         if not l:
             continue
-        l_low = l.lower()
-
-        # strip known labels but KEEP the rest of the line
-        for p in KEEP_PREFIXES:
-            if l_low.startswith(p):
+        low = l.lower()
+        for p in PREFIXES:
+            if low.startswith(p):
                 l = l[len(p):].strip(" -:\t")
-                l_low = l.lower()
                 break
+        processed.append(l)
 
-        # drop lines that are SHORT and clearly admin-only
-        if len(l.split()) <= 8 and re.search(
-            r"\b(next agent|case (?:closed|id)|follow-?up|see (?:link|attached)|link|ticket|ref[:#]?\s*\w+|appointment|reschedule|schedule|call(ed)?|whatsapp)\b",
-            l_low,
-        ):
-            continue
-
-        lines.append(l)
-
-    cleaned = re.sub(r"\s+", " ", " ".join(lines)).strip()
+    cleaned = re.sub(r"\s+", " ", " ".join(processed)).strip()
     if len(cleaned) > max_chars:
         cleaned = cleaned[:max_chars]
-
-    return cleaned, raw_trunc
-
+    return cleaned
 
 def is_empty_output(out: dict) -> bool:
-    """True if all arrays are empty/missing."""
+    """True if all arrays are empty or missing."""
     return not (out.get("all_case_themes") or out.get("subcategory_themes") or out.get("evidence_spans"))
 
 
@@ -319,47 +308,42 @@ else:
 
         for k, i in enumerate(idx, start=1):
             raw_txt = str(work.at[i, text_col]).strip()
+            raw_trunc = raw_txt[:5000]  # primary uses RAW (truncated), no cleaning
         
-            # gentle clean
-            cleaned, raw_trunc = gentle_clean(raw_txt)
+            used_cleaning = False
+            used_summary  = False
         
-            # If cleaning removed too much, use RAW for primary extraction
-            use_raw = (len(cleaned) < 0.6 * max(1, len(raw_trunc))) or (len(cleaned.split()) < 25)
-            primary_text = raw_trunc if use_raw else cleaned
-        
-            used_summary = False
-        
-            # 1) Primary extract
+            # 1) Primary extract on RAW (truncated)
             try:
-                out, _raw = call_gemini_extract(system_prompt.strip(), primary_text)
+                out, _raw = call_gemini_extract(system_prompt.strip(), raw_trunc)
             except Exception:
-                # 2) Fallback on error: summarize RAW, then extract
+                # 2) Fallback A (error): very gentle clean, then extract
+                cleaned = gentle_clean_soft(raw_trunc)
+                used_cleaning = True
                 try:
-                    summary = call_gemini_summarize(raw_trunc or raw_txt)
-                    used_summary = True
-                    out, _ = call_gemini_extract(system_prompt.strip(), summary or (raw_trunc or raw_txt))
+                    out, _ = call_gemini_extract(system_prompt.strip(), cleaned or raw_trunc)
                 except Exception:
                     out = {"all_case_themes": [], "subcategory_themes": [], "evidence_spans": []}
         
-            # 3) If output still empty: summarize RAW, then extract
+            # 3) If output still empty: Fallback B (summarize RAW), then extract
             if is_empty_output(out):
                 try:
-                    summary2 = call_gemini_summarize(raw_trunc or raw_txt)
                     used_summary = True
-                    out2, _ = call_gemini_extract(system_prompt.strip(), summary2 or (raw_trunc or raw_txt))
+                    summary = call_gemini_summarize(raw_trunc)  # always summarize RAW
+                    out2, _ = call_gemini_extract(system_prompt.strip(), summary or raw_trunc)
                     if not is_empty_output(out2):
                         out = out2
                 except Exception:
-                    pass
+                    pass  # keep 'out' as-is (empty arrays)
         
             results.append({
                 "row_id": int(work.at[i, "row_id"]),
-                "complaint_excerpt": (raw_txt[:200] if isinstance(raw_txt, str) else ""),
+                "complaint_excerpt": raw_txt[:200],
                 "all_case_themes": out.get("all_case_themes", []),
                 "subcategory_themes": out.get("subcategory_themes", []),
                 "evidence_spans": out.get("evidence_spans", []),
+                "used_cleaning": bool(used_cleaning),
                 "used_summary": bool(used_summary),
-                "used_raw": bool(use_raw),
             })
         
             prog.progress(k / len(idx))
@@ -390,6 +374,7 @@ else:
             "(ordered by row_id)."
         )
 
+ 
     # Optional: retry only empty rows (runs summarize-then-extract again)
     retry_empty = st.button("Retry empty rows (fallback again)")
     if retry_empty and st.session_state.get("last_results") is not None:
@@ -399,27 +384,39 @@ else:
             (out_df["subcategory_themes"].apply(lambda x: len(x)==0)) &
             (out_df["evidence_spans"].apply(lambda x: len(x)==0))
         ]
-
+    
         if len(empties) == 0:
             st.success("No empty rows to retry.")
         else:
             st.write(f"Retrying {len(empties)} empty rows…")
             for j in empties:
-                row = out_df.loc[j]
-                # We don't have the full original text here, only the excerpt; re-use excerpt
-                base_text = row["complaint_excerpt"]
-                cleaned = clean_complaint(base_text)
+                base = out_df.loc[j, "complaint_excerpt"]
+                raw_trunc = base[:5000]
+    
+                # Try gentle clean first on retry
+                cleaned = gentle_clean_soft(raw_trunc)
                 try:
-                    summary = call_gemini_summarize(cleaned or base_text)
-                    out2, _ = call_gemini_extract(system_prompt.strip(), summary or (cleaned or base_text))
-                    if not is_empty_output(out2):
-                        out_df.at[j, "all_case_themes"] = out2.get("all_case_themes", [])
-                        out_df.at[j, "subcategory_themes"] = out2.get("subcategory_themes", [])
-                        out_df.at[j, "evidence_spans"] = out2.get("evidence_spans", [])
-                        out_df.at[j, "used_summary"] = True
+                    out2, _ = call_gemini_extract(system_prompt.strip(), cleaned or raw_trunc)
                 except Exception:
-                    pass
-
+                    out2 = {"all_case_themes": [], "subcategory_themes": [], "evidence_spans": []}
+    
+                # If still empty, summarize raw and extract
+                if is_empty_output(out2):
+                    try:
+                        summary = call_gemini_summarize(raw_trunc)
+                        out3, _ = call_gemini_extract(system_prompt.strip(), summary or raw_trunc)
+                        if not is_empty_output(out3):
+                            out2 = out3
+                    except Exception:
+                        pass
+    
+                if not is_empty_output(out2):
+                    out_df.at[j, "all_case_themes"] = out2.get("all_case_themes", [])
+                    out_df.at[j, "subcategory_themes"] = out2.get("subcategory_themes", [])
+                    out_df.at[j, "evidence_spans"] = out2.get("evidence_spans", [])
+                    out_df.at[j, "used_cleaning"] = True  # this retry tried cleaning/summary
+                    out_df.at[j, "used_summary"] = out_df.at[j, "used_summary"] or (is_empty_output(out2) == False)
+    
             st.session_state["last_results"] = out_df
             st.success("Retry pass completed.")
             st.dataframe(out_df.head(20), use_container_width=True)
