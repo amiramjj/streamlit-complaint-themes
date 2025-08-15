@@ -78,7 +78,7 @@ def call_gemini_extract(system_instruction: str, complaint_text: str):
             },
             "required": ["all_case_themes", "subcategory_themes", "evidence_spans"]
         },
-        "max_output_tokens": 256,
+        "max_output_tokens": 512,
         "temperature": 0.2,
     }
     resp = model.generate_content(
@@ -222,11 +222,7 @@ else:
 
 
 
-# ---------- Batch extraction: run + export ----------
-import time
-import pandas as pd
-import streamlit as st
-
+# Batch run & export (5 retries, then summarize→extract on 6th)
 st.header("Batch extraction — run & export")
 
 df = st.session_state.get("df")
@@ -235,7 +231,7 @@ text_col = st.session_state.get("text_col")
 if df is None or text_col is None:
     st.caption("Upload a file and select the text column above to enable batch extraction.")
 else:
-    col1, col2 = st.columns([1,1])
+    col1, col2 = st.columns([1, 1])
     with col1:
         skip_no_complaint = st.checkbox("Skip rows where text equals 'no complaint'", value=True)
     with col2:
@@ -244,9 +240,6 @@ else:
     go_batch = st.button("Run extraction on uploaded file")
 
     if go_batch:
-        if "GOOGLE_API_KEY" not in st.secrets:
-            st.error("No GOOGLE_API_KEY in Secrets.")
-            st.stop()
         if not system_prompt.strip():
             st.error("Paste your System instruction in the Gemini test box above.")
             st.stop()
@@ -269,22 +262,42 @@ else:
 
         for k, i in enumerate(idx, start=1):
             txt = str(work.at[i, text_col]).strip()
-            # retry/backoff
+
             attempts = 0
             while True:
                 try:
-                    out = call_gemini(system_prompt.strip(), txt)
+                    # attempts 1–5: primary extractor
+                    out, _ = call_gemini_extract(system_prompt.strip(), txt)
                     themes = out.get("all_case_themes", [])
+                    subs   = out.get("subcategory_themes", [])
                     break
                 except Exception:
                     attempts += 1
-                    if attempts >= 5:
-                        themes = []
-                        st.warning(f"Row {work.at[i,'row_id']} failed after retries. Saved empty list.")
-                        break
-                    time.sleep(min(2**attempts, 10))
 
-            results.append({"row_id": work.at[i, "row_id"], "all_case_themes": themes})
+                    # attempts 1–5: retry primary with backoff
+                    if attempts < 6:
+                        time.sleep(min(2 ** attempts, 10))
+                        continue
+
+                    # attempt 6: summarize → extract once
+                    try:
+                        sm = call_gemini_summarize(txt)
+                        if not sm:
+                            raise RuntimeError("Empty summary from fallback")
+                        out2, _ = call_gemini_extract(system_prompt.strip(), sm)
+                        themes = out2.get("all_case_themes", [])
+                        subs   = out2.get("subcategory_themes", [])
+                        break
+                    except Exception:
+                        themes, subs = [], []
+                        st.warning(f"Row {work.at[i,'row_id']} failed after 5 retries + summarize fallback. Saved empty lists.")
+                        break
+
+            results.append({
+                "row_id": work.at[i, "row_id"],
+                "all_case_themes": themes,
+                "subcategory_themes": subs
+            })
             prog.progress(k / len(idx))
             status.write(f"Processed {k}/{len(idx)}")
 
@@ -292,9 +305,12 @@ else:
         st.subheader("Sample of results")
         st.dataframe(out_df.head(20), use_container_width=True)
 
-        csv_bytes = out_df[["row_id", "all_case_themes"]].to_csv(index=False).encode("utf-8")
-        st.download_button("Download themes CSV", data=csv_bytes,
-                           file_name="all_case_themes.csv", mime="text/csv")
+        # Export only the two arrays (plus row_id) as requested
+        csv_bytes = out_df[["row_id", "all_case_themes", "subcategory_themes"]].to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download themes CSV",
+            data=csv_bytes,
+            file_name="themes_subcategories.csv",
+            mime="text/csv"
+        )
         st.info(f"Export ready. Source rows: {len(work)} • Labeled rows: {len(out_df)} (ordered by row_id).")
-
-
