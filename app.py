@@ -19,6 +19,10 @@ st.write("Model:", st.secrets.get("MODEL_NAME"))
 
 
 # ---------- Gemini test (single row) ----------
+import json
+import streamlit as st
+import google.generativeai as genai
+
 st.header("Gemini test (single row)")
 
 # 1) Check secret
@@ -31,32 +35,58 @@ genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
 MODEL_NAME = st.secrets.get("MODEL_NAME", "gemini-2.5-flash-lite")
 
 # 3) Inputs
-system_prompt = st.text_area("System instruction (paste yours here)", height=220, value=st.session_state.get("system_prompt", ""))
-sample_text  = st.text_area("One complaint_summary to test", height=120, value=st.session_state.get("sample_text", ""))
+system_prompt = st.text_area(
+    "System instruction (paste yours here)",
+    height=220,
+    value=st.session_state.get("system_prompt", "")
+)
+sample_text = st.text_area(
+    "One complaint_summary to test",
+    height=120,
+    value=st.session_state.get("sample_text", "")
+)
 go = st.button("Test Gemini")
 
 def call_gemini(system_instruction: str, complaint_text: str):
     """
     Expects STRICT JSON with:
-      {
-        "all_case_themes": [string, ...],
-        "subcategory_themes": [string, ...]
-      }
+    {
+      "all_case_themes": [string, ...],
+      "subcategory_themes": [string, ...],
+      "evidence_spans": [{"quote": string}, ...]
+    }
     """
     model = genai.GenerativeModel(
         model_name=MODEL_NAME,
         system_instruction=system_instruction
     )
+
     generation_config = {
         "response_mime_type": "application/json",
         "response_schema": {
             "type": "object",
             "properties": {
-                "all_case_themes":    {"type": "array", "items": {"type": "string"}},
-                "subcategory_themes": {"type": "array", "items": {"type": "string"}}
+                "all_case_themes": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                },
+                "subcategory_themes": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                },
+                "evidence_spans": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "quote": {"type": "string"}
+                        },
+                        "required": ["quote"]
+                    }
+                }
             },
-            "required": ["all_case_themes", "subcategory_themes"]
-            # NOTE: no 'additionalProperties' — Gemini doesn't support that field
+            "required": ["all_case_themes", "subcategory_themes", "evidence_spans"]
+            # NOTE: don't add 'additionalProperties' — Gemini schemas don't support it
         }
     }
 
@@ -73,17 +103,29 @@ def call_gemini(system_instruction: str, complaint_text: str):
 
     data = json.loads(raw_text or "{}")
 
-    # Keep only the keys we care about (ignore any extras)
-    data = {
-        "all_case_themes": data.get("all_case_themes", []),
-        "subcategory_themes": data.get("subcategory_themes", [])
+    # Normalize/guard: keep only the keys we care about and coerce shapes
+    out = {
+        "all_case_themes": data.get("all_case_themes", []) or [],
+        "subcategory_themes": data.get("subcategory_themes", []) or [],
+        "evidence_spans": []
     }
-    return data, raw_text
+
+    # evidence_spans can be [{"quote": "..."}] or (rarely) ["..."]
+    spans = data.get("evidence_spans", []) or []
+    norm_spans = []
+    for s in spans:
+        if isinstance(s, dict) and "quote" in s:
+            norm_spans.append({"quote": str(s["quote"])})
+        elif isinstance(s, str):
+            norm_spans.append({"quote": s})
+    out["evidence_spans"] = norm_spans
+
+    return out, raw_text
 
 if go:
     # remember inputs between reruns
     st.session_state["system_prompt"] = system_prompt
-    st.session_state["sample_text"]  = sample_text
+    st.session_state["sample_text"] = sample_text
 
     try:
         out, raw = call_gemini(system_prompt.strip(), sample_text.strip())
