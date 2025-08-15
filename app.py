@@ -218,40 +218,57 @@ else:
     st.caption("Upload a CSV or Excel file to continue.")
 
 
-# ---------- Helpers: cleaning & empty-output check ----------
-ADMIN_PATTERNS = [
-    r"^\s*full summary\s*:", r"^\s*recent summary\s*:", r"^\s*disclaimer\s*:",
-    r"\bnext agent\b", r"\bmediator visit\b", r"\bcase (?:closed|id)\b",
-    r"\blink\b", r"https?://\S+", r"\bwhatsapp\b", r"\bcall(ed|s)?\b",
-    r"\brefund\b", r"\bsubscription\b", r"\bappointment\b", r"\breschedule\b",
-]
+# ---------- Helpers: gentle cleaning & empty-output check ----------
+import re
 
-def clean_complaint(text: str, max_chars: int = 2000) -> str:
-    """Remove admin/boilerplate lines, URLs, and trim length."""
+KEEP_PREFIXES = ("disclaimer:", "full summary:", "recent summary:", "summary:", "note:")
+
+def gentle_clean(text: str, max_chars: int = 2500):
+    """
+    Keep signal; remove only obvious admin noise.
+    Returns (cleaned_text, raw_truncated_text).
+    """
     if not isinstance(text, str):
-        return ""
-    # Remove URLs
-    text = re.sub(r"https?://\S+|www\.\S+", "", text, flags=re.IGNORECASE)
-    # Drop admin lines / boilerplate markers
+        return "", ""
+    raw = text.strip()
+    # truncate raw early (we may need it)
+    raw_trunc = raw[: max_chars * 2]
+
+    # strip URLs
+    no_urls = re.sub(r"https?://\S+|www\.\S+", "", raw_trunc, flags=re.IGNORECASE)
+
     lines = []
-    for line in str(text).splitlines():
-        keep = True
-        for pat in ADMIN_PATTERNS:
-            if re.search(pat, line, flags=re.IGNORECASE):
-                keep = False
+    for line in no_urls.splitlines():
+        l = line.strip()
+        if not l:
+            continue
+        l_low = l.lower()
+
+        # strip known labels but KEEP the rest of the line
+        for p in KEEP_PREFIXES:
+            if l_low.startswith(p):
+                l = l[len(p):].strip(" -:\t")
+                l_low = l.lower()
                 break
-        if keep:
-            lines.append(line)
-    cleaned = " ".join(lines)
-    # Collapse whitespace
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    # Trim to max_chars
+
+        # drop lines that are SHORT and clearly admin-only
+        if len(l.split()) <= 8 and re.search(
+            r"\b(next agent|case (?:closed|id)|follow-?up|see (?:link|attached)|link|ticket|ref[:#]?\s*\w+|appointment|reschedule|schedule|call(ed)?|whatsapp)\b",
+            l_low,
+        ):
+            continue
+
+        lines.append(l)
+
+    cleaned = re.sub(r"\s+", " ", " ".join(lines)).strip()
     if len(cleaned) > max_chars:
         cleaned = cleaned[:max_chars]
-    return cleaned
+
+    return cleaned, raw_trunc
+
 
 def is_empty_output(out: dict) -> bool:
-    """True if all arrays are empty or missing."""
+    """True if all arrays are empty/missing."""
     return not (out.get("all_case_themes") or out.get("subcategory_themes") or out.get("evidence_spans"))
 
 
@@ -302,44 +319,52 @@ else:
 
         for k, i in enumerate(idx, start=1):
             raw_txt = str(work.at[i, text_col]).strip()
-            cleaned = clean_complaint(raw_txt)
-
-            # Primary extract on cleaned text
+        
+            # gentle clean
+            cleaned, raw_trunc = gentle_clean(raw_txt)
+        
+            # If cleaning removed too much, use RAW for primary extraction
+            use_raw = (len(cleaned) < 0.6 * max(1, len(raw_trunc))) or (len(cleaned.split()) < 25)
+            primary_text = raw_trunc if use_raw else cleaned
+        
             used_summary = False
+        
+            # 1) Primary extract
             try:
-                out, _raw = call_gemini_extract(system_prompt.strip(), cleaned)
+                out, _raw = call_gemini_extract(system_prompt.strip(), primary_text)
             except Exception:
-                # Summarize then extract (fallback on error)
+                # 2) Fallback on error: summarize RAW, then extract
                 try:
-                    summary = call_gemini_summarize(cleaned or raw_txt)
+                    summary = call_gemini_summarize(raw_trunc or raw_txt)
                     used_summary = True
-                    out, _raw2 = call_gemini_extract(system_prompt.strip(), summary or (cleaned or raw_txt))
+                    out, _ = call_gemini_extract(system_prompt.strip(), summary or (raw_trunc or raw_txt))
                 except Exception:
                     out = {"all_case_themes": [], "subcategory_themes": [], "evidence_spans": []}
-
-            # If output is empty, run summarize-then-extract fallback
+        
+            # 3) If output still empty: summarize RAW, then extract
             if is_empty_output(out):
                 try:
-                    summary2 = call_gemini_summarize(cleaned or raw_txt)
+                    summary2 = call_gemini_summarize(raw_trunc or raw_txt)
                     used_summary = True
-                    out2, _ = call_gemini_extract(system_prompt.strip(), summary2 or (cleaned or raw_txt))
+                    out2, _ = call_gemini_extract(system_prompt.strip(), summary2 or (raw_trunc or raw_txt))
                     if not is_empty_output(out2):
                         out = out2
                 except Exception:
-                    pass  # keep empty out
-
+                    pass
+        
             results.append({
                 "row_id": int(work.at[i, "row_id"]),
-                "complaint_excerpt": raw_txt[:200],
+                "complaint_excerpt": (raw_txt[:200] if isinstance(raw_txt, str) else ""),
                 "all_case_themes": out.get("all_case_themes", []),
                 "subcategory_themes": out.get("subcategory_themes", []),
                 "evidence_spans": out.get("evidence_spans", []),
                 "used_summary": bool(used_summary),
+                "used_raw": bool(use_raw),
             })
-
+        
             prog.progress(k / len(idx))
             status.write(f"Processed {k}/{len(idx)}")
-
+    
         # Assemble ordered output
         out_df = pd.DataFrame(results).sort_values("row_id")
         st.session_state["last_results"] = out_df  # keep for "Retry empty rows"
