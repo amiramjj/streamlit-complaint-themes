@@ -261,13 +261,18 @@ def is_empty_output(out: dict) -> bool:
     return not (out.get("all_case_themes") or out.get("subcategory_themes") or out.get("evidence_spans"))
 
 
-# ---------- Batch extraction — run & export (with summarize-on-error + on-empty fallback) ----------
+# ---------- Batch extraction — run & export (no cleaning; retry empties via summary) ----------
 import time, json
+import pandas as pd
+import streamlit as st
 
 st.header("Batch extraction — run & export")
 
 df = st.session_state.get("df")
 text_col = st.session_state.get("text_col")
+
+def is_empty_output(out: dict) -> bool:
+    return not (out.get("all_case_themes") or out.get("subcategory_themes") or out.get("evidence_spans"))
 
 if df is None or text_col is None:
     st.caption("Upload a file and select the text column above to enable batch extraction.")
@@ -284,7 +289,7 @@ else:
         if "GOOGLE_API_KEY" not in st.secrets:
             st.error("No GOOGLE_API_KEY in Secrets.")
             st.stop()
-        if not system_prompt.strip():
+        if not st.session_state.get("system_prompt", "").strip():
             st.error("Paste your System instruction in the Gemini test box above.")
             st.stop()
 
@@ -308,50 +313,62 @@ else:
 
         for k, i in enumerate(idx, start=1):
             raw_txt = str(work.at[i, text_col]).strip()
-            raw_trunc = raw_txt[:5000]  # primary uses RAW (truncated), no cleaning
-        
-            used_cleaning = False
-            used_summary  = False
-        
-            # 1) Primary extract on RAW (truncated)
+            raw_trunc = raw_txt[:5000]  # primary uses RAW (truncated)
+
+            used_summary = False
+
+            # 1) Primary extract on RAW (no cleaning)
             try:
-                out, _raw = call_gemini_extract(system_prompt.strip(), raw_trunc)
+                out, _ = call_gemini_extract(st.session_state["system_prompt"].strip(), raw_trunc)
             except Exception:
-                # 2) Fallback A (error): very gentle clean, then extract
-                cleaned = gentle_clean_soft(raw_trunc)
-                used_cleaning = True
+                # 2) On error: summarize then extract
+                used_summary = True
                 try:
-                    out, _ = call_gemini_extract(system_prompt.strip(), cleaned or raw_trunc)
+                    summary = call_gemini_summarize(raw_trunc)
+                    out, _ = call_gemini_extract(st.session_state["system_prompt"].strip(), summary or raw_trunc)
                 except Exception:
                     out = {"all_case_themes": [], "subcategory_themes": [], "evidence_spans": []}
-        
-            # 3) If output still empty: Fallback B (summarize RAW), then extract
+
+            # 3) If output empty: summarize then extract
             if is_empty_output(out):
                 try:
                     used_summary = True
-                    summary = call_gemini_summarize(raw_trunc)  # always summarize RAW
-                    out2, _ = call_gemini_extract(system_prompt.strip(), summary or raw_trunc)
+                    summary2 = call_gemini_summarize(raw_trunc)
+                    out2, _ = call_gemini_extract(st.session_state["system_prompt"].strip(), summary2 or raw_trunc)
                     if not is_empty_output(out2):
                         out = out2
                 except Exception:
-                    pass  # keep 'out' as-is (empty arrays)
-        
+                    pass  # keep empty
+
             results.append({
                 "row_id": int(work.at[i, "row_id"]),
                 "complaint_excerpt": raw_txt[:200],
                 "all_case_themes": out.get("all_case_themes", []),
                 "subcategory_themes": out.get("subcategory_themes", []),
                 "evidence_spans": out.get("evidence_spans", []),
-                "used_cleaning": bool(used_cleaning),
                 "used_summary": bool(used_summary),
             })
-        
+
             prog.progress(k / len(idx))
             status.write(f"Processed {k}/{len(idx)}")
-    
-        # Assemble ordered output
+
+        # Assemble ordered output and store for retry
         out_df = pd.DataFrame(results).sort_values("row_id")
-        st.session_state["last_results"] = out_df  # keep for "Retry empty rows"
+        st.session_state["last_results"] = out_df
+        st.session_state["orig_df"] = df
+        st.session_state["orig_text_col"] = text_col
+
+        # Show empties
+        empty_mask = (
+            out_df["all_case_themes"].apply(lambda x: len(x) == 0) &
+            out_df["subcategory_themes"].apply(lambda x: len(x) == 0) &
+            out_df["evidence_spans"].apply(lambda x: len(x) == 0)
+        )
+        empty_row_ids = out_df.loc[empty_mask, "row_id"].astype(int).tolist()
+        if empty_row_ids:
+            st.warning(f"Empty outputs for {len(empty_row_ids)} row(s). Row IDs: {empty_row_ids[:50]}{' …' if len(empty_row_ids)>50 else ''}")
+        else:
+            st.success("No empty outputs 🎉")
 
         st.subheader("Sample of results")
         st.dataframe(out_df.head(20), use_container_width=True)
@@ -374,7 +391,58 @@ else:
             "(ordered by row_id)."
         )
 
- 
+    # ---------- Retry only empty rows (summary → extract) ----------
+    retry_empty = st.button("Retry empty rows (summarize then extract)")
+    if retry_empty and st.session_state.get("last_results") is not None:
+        out_df = st.session_state["last_results"].copy()
+        orig_df = st.session_state["orig_df"]
+        tcol = st.session_state["orig_text_col"]
+
+        empty_mask = (
+            out_df["all_case_themes"].apply(lambda x: len(x) == 0) &
+            out_df["subcategory_themes"].apply(lambda x: len(x) == 0) &
+            out_df["evidence_spans"].apply(lambda x: len(x) == 0)
+        )
+        to_retry = out_df.loc[empty_mask, "row_id"].astype(int).tolist()
+
+        if not to_retry:
+            st.success("No empty rows to retry.")
+        else:
+            st.write(f"Retrying {len(to_retry)} empty row(s)…")
+            for rid in to_retry:
+                raw_txt = str(orig_df.iloc[rid][tcol]).strip()
+                raw_trunc = raw_txt[:5000]
+                try:
+                    summary = call_gemini_summarize(raw_trunc)
+                    out, _ = call_gemini_extract(st.session_state["system_prompt"].strip(), summary or raw_trunc)
+                except Exception:
+                    out = {"all_case_themes": [], "subcategory_themes": [], "evidence_spans": []}
+
+                # Update the single row in out_df
+                mask = out_df["row_id"].astype(int) == int(rid)
+                out_df.loc[mask, "all_case_themes"] = [out.get("all_case_themes", [])]
+                out_df.loc[mask, "subcategory_themes"] = [out.get("subcategory_themes", [])]
+                out_df.loc[mask, "evidence_spans"] = [out.get("evidence_spans", [])]
+                out_df.loc[mask, "used_summary"] = True
+
+            st.session_state["last_results"] = out_df
+
+            st.success("Retry pass completed.")
+            st.subheader("Updated sample")
+            st.dataframe(out_df.head(20), use_container_width=True)
+
+            # Fresh download after retry
+            csv_df = out_df.copy()
+            for col in ["all_case_themes", "subcategory_themes", "evidence_spans"]:
+                csv_df[col] = csv_df[col].apply(lambda x: json.dumps(x, ensure_ascii=False))
+            csv_bytes = csv_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download updated CSV",
+                data=csv_bytes,
+                file_name="themes_with_subcats_and_evidence_updated.csv",
+                mime="text/csv"
+            )
+
     # Optional: retry only empty rows (runs summarize-then-extract again)
     retry_empty = st.button("Retry empty rows (fallback again)")
     if retry_empty and st.session_state.get("last_results") is not None:
