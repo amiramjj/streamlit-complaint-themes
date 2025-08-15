@@ -159,8 +159,10 @@ if go:
             st.error(f"Fallback also failed: {e2}")
 
 
+
+
+
 # ---------- Batch setup: upload & select column (robust) ----------
-import re
 import pandas as pd
 import streamlit as st
 
@@ -170,6 +172,7 @@ uploaded = st.file_uploader("Upload CSV (or Excel) with a complaint text column"
                             type=["csv", "xlsx"])
 
 def load_table(file):
+    import pandas as pd
     # Empty file guard
     try:
         nbytes = getattr(file, "size", None) or file.getbuffer().nbytes
@@ -181,7 +184,6 @@ def load_table(file):
     file.seek(0)
     if file.name.lower().endswith(".xlsx"):
         return pd.read_excel(file)
-
     # CSV: auto-detect delimiter, tolerate weird encodings
     try:
         file.seek(0)
@@ -216,53 +218,6 @@ if uploaded is not None:
     st.dataframe(work[["row_id", text_col]].head(10), use_container_width=True)
 else:
     st.caption("Upload a CSV or Excel file to continue.")
-
-
-
-# ---------- Helpers: very gentle cleaning & empty-output check ----------
-import re
-
-PREFIXES = ("disclaimer:", "full summary:", "recent summary:", "summary:", "note:")
-
-def gentle_clean_soft(text: str, max_chars: int = 3000) -> str:
-    """
-    Super minimal cleaning:
-      - remove URLs
-      - strip known prefixes (keep rest of the line)
-      - collapse whitespace
-      - trim to max_chars
-    Used only if primary extraction errors or returns empty.
-    """
-    if not isinstance(text, str):
-        return ""
-    # remove URLs anywhere
-    no_urls = re.sub(r"https?://\S+|www\.\S+", "", text, flags=re.IGNORECASE)
-
-    # strip label prefixes, KEEP content
-    processed = []
-    for line in no_urls.splitlines():
-        l = line.strip()
-        if not l:
-            continue
-        low = l.lower()
-        for p in PREFIXES:
-            if low.startswith(p):
-                l = l[len(p):].strip(" -:\t")
-                break
-        processed.append(l)
-
-    cleaned = re.sub(r"\s+", " ", " ".join(processed)).strip()
-    if len(cleaned) > max_chars:
-        cleaned = cleaned[:max_chars]
-    return cleaned
-
-def is_empty_output(out: dict) -> bool:
-    """True if all arrays are empty or missing."""
-    return not (out.get("all_case_themes") or out.get("subcategory_themes") or out.get("evidence_spans"))
-
-
-
-
 
 
 
@@ -341,3 +296,5 @@ else:
         st.download_button("Download themes CSV", data=csv_bytes,
                            file_name="all_case_themes.csv", mime="text/csv")
         st.info(f"Export ready. Source rows: {len(work)} • Labeled rows: {len(out_df)} (ordered by row_id).")
+
+
