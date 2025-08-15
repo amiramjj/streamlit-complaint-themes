@@ -160,6 +160,7 @@ if go:
 
 
 # ---------- Batch setup: upload & select column (robust) ----------
+import re
 import pandas as pd
 import streamlit as st
 
@@ -169,7 +170,6 @@ uploaded = st.file_uploader("Upload CSV (or Excel) with a complaint text column"
                             type=["csv", "xlsx"])
 
 def load_table(file):
-    import pandas as pd
     # Empty file guard
     try:
         nbytes = getattr(file, "size", None) or file.getbuffer().nbytes
@@ -181,6 +181,7 @@ def load_table(file):
     file.seek(0)
     if file.name.lower().endswith(".xlsx"):
         return pd.read_excel(file)
+
     # CSV: auto-detect delimiter, tolerate weird encodings
     try:
         file.seek(0)
@@ -216,10 +217,46 @@ if uploaded is not None:
 else:
     st.caption("Upload a CSV or Excel file to continue.")
 
-# ---------- Batch extraction — run & export (with summarize-on-error fallback) ----------
+
+# ---------- Helpers: cleaning & empty-output check ----------
+ADMIN_PATTERNS = [
+    r"^\s*full summary\s*:", r"^\s*recent summary\s*:", r"^\s*disclaimer\s*:",
+    r"\bnext agent\b", r"\bmediator visit\b", r"\bcase (?:closed|id)\b",
+    r"\blink\b", r"https?://\S+", r"\bwhatsapp\b", r"\bcall(ed|s)?\b",
+    r"\brefund\b", r"\bsubscription\b", r"\bappointment\b", r"\breschedule\b",
+]
+
+def clean_complaint(text: str, max_chars: int = 2000) -> str:
+    """Remove admin/boilerplate lines, URLs, and trim length."""
+    if not isinstance(text, str):
+        return ""
+    # Remove URLs
+    text = re.sub(r"https?://\S+|www\.\S+", "", text, flags=re.IGNORECASE)
+    # Drop admin lines / boilerplate markers
+    lines = []
+    for line in str(text).splitlines():
+        keep = True
+        for pat in ADMIN_PATTERNS:
+            if re.search(pat, line, flags=re.IGNORECASE):
+                keep = False
+                break
+        if keep:
+            lines.append(line)
+    cleaned = " ".join(lines)
+    # Collapse whitespace
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Trim to max_chars
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars]
+    return cleaned
+
+def is_empty_output(out: dict) -> bool:
+    """True if all arrays are empty or missing."""
+    return not (out.get("all_case_themes") or out.get("subcategory_themes") or out.get("evidence_spans"))
+
+
+# ---------- Batch extraction — run & export (with summarize-on-error + on-empty fallback) ----------
 import time, json
-import pandas as pd
-import streamlit as st
 
 st.header("Batch extraction — run & export")
 
@@ -264,28 +301,40 @@ else:
         results = []
 
         for k, i in enumerate(idx, start=1):
-            txt = str(work.at[i, text_col]).strip()
+            raw_txt = str(work.at[i, text_col]).strip()
+            cleaned = clean_complaint(raw_txt)
 
-            # Try primary extractor first; on error, summarize then extract
+            # Primary extract on cleaned text
+            used_summary = False
             try:
-                out, _raw = call_gemini_extract(system_prompt.strip(), txt)
+                out, _raw = call_gemini_extract(system_prompt.strip(), cleaned)
             except Exception:
+                # Summarize then extract (fallback on error)
                 try:
-                    summary = call_gemini_summarize(txt)
-                    out, _raw2 = call_gemini_extract(system_prompt.strip(), summary or txt)
+                    summary = call_gemini_summarize(cleaned or raw_txt)
+                    used_summary = True
+                    out, _raw2 = call_gemini_extract(system_prompt.strip(), summary or (cleaned or raw_txt))
                 except Exception:
-                    # Final fallback: empty payload
-                    out = {
-                        "all_case_themes": [],
-                        "subcategory_themes": [],
-                        "evidence_spans": []
-                    }
+                    out = {"all_case_themes": [], "subcategory_themes": [], "evidence_spans": []}
+
+            # If output is empty, run summarize-then-extract fallback
+            if is_empty_output(out):
+                try:
+                    summary2 = call_gemini_summarize(cleaned or raw_txt)
+                    used_summary = True
+                    out2, _ = call_gemini_extract(system_prompt.strip(), summary2 or (cleaned or raw_txt))
+                    if not is_empty_output(out2):
+                        out = out2
+                except Exception:
+                    pass  # keep empty out
 
             results.append({
                 "row_id": int(work.at[i, "row_id"]),
+                "complaint_excerpt": raw_txt[:200],
                 "all_case_themes": out.get("all_case_themes", []),
                 "subcategory_themes": out.get("subcategory_themes", []),
                 "evidence_spans": out.get("evidence_spans", []),
+                "used_summary": bool(used_summary),
             })
 
             prog.progress(k / len(idx))
@@ -293,6 +342,7 @@ else:
 
         # Assemble ordered output
         out_df = pd.DataFrame(results).sort_values("row_id")
+        st.session_state["last_results"] = out_df  # keep for "Retry empty rows"
 
         st.subheader("Sample of results")
         st.dataframe(out_df.head(20), use_container_width=True)
@@ -314,3 +364,37 @@ else:
             f"Export ready. Source rows: {len(work)} • Labeled rows: {len(out_df)} "
             "(ordered by row_id)."
         )
+
+    # Optional: retry only empty rows (runs summarize-then-extract again)
+    retry_empty = st.button("Retry empty rows (fallback again)")
+    if retry_empty and st.session_state.get("last_results") is not None:
+        out_df = st.session_state["last_results"].copy()
+        empties = out_df.index[
+            (out_df["all_case_themes"].apply(lambda x: len(x)==0)) &
+            (out_df["subcategory_themes"].apply(lambda x: len(x)==0)) &
+            (out_df["evidence_spans"].apply(lambda x: len(x)==0))
+        ]
+
+        if len(empties) == 0:
+            st.success("No empty rows to retry.")
+        else:
+            st.write(f"Retrying {len(empties)} empty rows…")
+            for j in empties:
+                row = out_df.loc[j]
+                # We don't have the full original text here, only the excerpt; re-use excerpt
+                base_text = row["complaint_excerpt"]
+                cleaned = clean_complaint(base_text)
+                try:
+                    summary = call_gemini_summarize(cleaned or base_text)
+                    out2, _ = call_gemini_extract(system_prompt.strip(), summary or (cleaned or base_text))
+                    if not is_empty_output(out2):
+                        out_df.at[j, "all_case_themes"] = out2.get("all_case_themes", [])
+                        out_df.at[j, "subcategory_themes"] = out2.get("subcategory_themes", [])
+                        out_df.at[j, "evidence_spans"] = out2.get("evidence_spans", [])
+                        out_df.at[j, "used_summary"] = True
+                except Exception:
+                    pass
+
+            st.session_state["last_results"] = out_df
+            st.success("Retry pass completed.")
+            st.dataframe(out_df.head(20), use_container_width=True)
