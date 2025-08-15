@@ -261,8 +261,14 @@ def is_empty_output(out: dict) -> bool:
     return not (out.get("all_case_themes") or out.get("subcategory_themes") or out.get("evidence_spans"))
 
 
-# ---------- Batch extraction — run & export (no cleaning; retry empties via summary) ----------
-import time, json
+
+
+
+
+
+
+# ---------- Batch extraction: run + export ----------
+import time
 import pandas as pd
 import streamlit as st
 
@@ -271,13 +277,10 @@ st.header("Batch extraction — run & export")
 df = st.session_state.get("df")
 text_col = st.session_state.get("text_col")
 
-def is_empty_output(out: dict) -> bool:
-    return not (out.get("all_case_themes") or out.get("subcategory_themes") or out.get("evidence_spans"))
-
 if df is None or text_col is None:
     st.caption("Upload a file and select the text column above to enable batch extraction.")
 else:
-    col1, col2 = st.columns([1, 1])
+    col1, col2 = st.columns([1,1])
     with col1:
         skip_no_complaint = st.checkbox("Skip rows where text equals 'no complaint'", value=True)
     with col2:
@@ -289,15 +292,13 @@ else:
         if "GOOGLE_API_KEY" not in st.secrets:
             st.error("No GOOGLE_API_KEY in Secrets.")
             st.stop()
-        if not st.session_state.get("system_prompt", "").strip():
+        if not system_prompt.strip():
             st.error("Paste your System instruction in the Gemini test box above.")
             st.stop()
 
         work = df.copy()
         work["row_id"] = range(len(work))
         col_series = work[text_col].astype(str)
-
-        # Valid rows: non-empty; optionally exclude literal "no complaint"
         valid = col_series.str.strip().ne("")
         if skip_no_complaint:
             valid &= col_series.str.strip().str.lower().ne("no complaint")
@@ -312,133 +313,31 @@ else:
         results = []
 
         for k, i in enumerate(idx, start=1):
-            raw_txt = str(work.at[i, text_col]).strip()
-            raw_trunc = raw_txt[:5000]  # primary uses RAW (truncated)
-
-            used_summary = False
-
-            # 1) Primary extract on RAW (no cleaning)
-            try:
-                out, _ = call_gemini_extract(st.session_state["system_prompt"].strip(), raw_trunc)
-            except Exception:
-                # 2) On error: summarize then extract
-                used_summary = True
+            txt = str(work.at[i, text_col]).strip()
+            # retry/backoff
+            attempts = 0
+            while True:
                 try:
-                    summary = call_gemini_summarize(raw_trunc)
-                    out, _ = call_gemini_extract(st.session_state["system_prompt"].strip(), summary or raw_trunc)
+                    out = call_gemini(system_prompt.strip(), txt)
+                    themes = out.get("all_case_themes", [])
+                    break
                 except Exception:
-                    out = {"all_case_themes": [], "subcategory_themes": [], "evidence_spans": []}
+                    attempts += 1
+                    if attempts >= 5:
+                        themes = []
+                        st.warning(f"Row {work.at[i,'row_id']} failed after retries. Saved empty list.")
+                        break
+                    time.sleep(min(2**attempts, 10))
 
-            # 3) If output empty: summarize then extract
-            if is_empty_output(out):
-                try:
-                    used_summary = True
-                    summary2 = call_gemini_summarize(raw_trunc)
-                    out2, _ = call_gemini_extract(st.session_state["system_prompt"].strip(), summary2 or raw_trunc)
-                    if not is_empty_output(out2):
-                        out = out2
-                except Exception:
-                    pass  # keep empty
-
-            results.append({
-                "row_id": int(work.at[i, "row_id"]),
-                "complaint_excerpt": raw_txt[:200],
-                "all_case_themes": out.get("all_case_themes", []),
-                "subcategory_themes": out.get("subcategory_themes", []),
-                "evidence_spans": out.get("evidence_spans", []),
-                "used_summary": bool(used_summary),
-            })
-
+            results.append({"row_id": work.at[i, "row_id"], "all_case_themes": themes})
             prog.progress(k / len(idx))
             status.write(f"Processed {k}/{len(idx)}")
 
-        # Assemble ordered output and store for retry
         out_df = pd.DataFrame(results).sort_values("row_id")
-        st.session_state["last_results"] = out_df
-        st.session_state["orig_df"] = df
-        st.session_state["orig_text_col"] = text_col
-
-        # Show empties
-        empty_mask = (
-            out_df["all_case_themes"].apply(lambda x: len(x) == 0) &
-            out_df["subcategory_themes"].apply(lambda x: len(x) == 0) &
-            out_df["evidence_spans"].apply(lambda x: len(x) == 0)
-        )
-        empty_row_ids = out_df.loc[empty_mask, "row_id"].astype(int).tolist()
-        if empty_row_ids:
-            st.warning(f"Empty outputs for {len(empty_row_ids)} row(s). Row IDs: {empty_row_ids[:50]}{' …' if len(empty_row_ids)>50 else ''}")
-        else:
-            st.success("No empty outputs 🎉")
-
         st.subheader("Sample of results")
         st.dataframe(out_df.head(20), use_container_width=True)
 
-        # Convert list / list-of-dicts to JSON strings for a clean CSV
-        csv_df = out_df.copy()
-        for col in ["all_case_themes", "subcategory_themes", "evidence_spans"]:
-            csv_df[col] = csv_df[col].apply(lambda x: json.dumps(x, ensure_ascii=False))
-
-        csv_bytes = csv_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download themes CSV",
-            data=csv_bytes,
-            file_name="themes_with_subcats_and_evidence.csv",
-            mime="text/csv"
-        )
-
-        st.info(
-            f"Export ready. Source rows: {len(work)} • Labeled rows: {len(out_df)} "
-            "(ordered by row_id)."
-        )
-
-    # ---------- Retry only empty rows (summary → extract) ----------
-    retry_empty = st.button("Retry empty rows (summarize then extract)")
-    if retry_empty and st.session_state.get("last_results") is not None:
-        out_df = st.session_state["last_results"].copy()
-        orig_df = st.session_state["orig_df"]
-        tcol = st.session_state["orig_text_col"]
-
-        empty_mask = (
-            out_df["all_case_themes"].apply(lambda x: len(x) == 0) &
-            out_df["subcategory_themes"].apply(lambda x: len(x) == 0) &
-            out_df["evidence_spans"].apply(lambda x: len(x) == 0)
-        )
-        to_retry = out_df.loc[empty_mask, "row_id"].astype(int).tolist()
-
-        if not to_retry:
-            st.success("No empty rows to retry.")
-        else:
-            st.write(f"Retrying {len(to_retry)} empty row(s)…")
-            for rid in to_retry:
-                raw_txt = str(orig_df.iloc[rid][tcol]).strip()
-                raw_trunc = raw_txt[:5000]
-                try:
-                    summary = call_gemini_summarize(raw_trunc)
-                    out, _ = call_gemini_extract(st.session_state["system_prompt"].strip(), summary or raw_trunc)
-                except Exception:
-                    out = {"all_case_themes": [], "subcategory_themes": [], "evidence_spans": []}
-
-                # Update the single row in out_df
-                mask = out_df["row_id"].astype(int) == int(rid)
-                out_df.loc[mask, "all_case_themes"] = [out.get("all_case_themes", [])]
-                out_df.loc[mask, "subcategory_themes"] = [out.get("subcategory_themes", [])]
-                out_df.loc[mask, "evidence_spans"] = [out.get("evidence_spans", [])]
-                out_df.loc[mask, "used_summary"] = True
-
-            st.session_state["last_results"] = out_df
-
-            st.success("Retry pass completed.")
-            st.subheader("Updated sample")
-            st.dataframe(out_df.head(20), use_container_width=True)
-
-            # Fresh download after retry
-            csv_df = out_df.copy()
-            for col in ["all_case_themes", "subcategory_themes", "evidence_spans"]:
-                csv_df[col] = csv_df[col].apply(lambda x: json.dumps(x, ensure_ascii=False))
-            csv_bytes = csv_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download updated CSV",
-                data=csv_bytes,
-                file_name="themes_with_subcats_and_evidence_updated.csv",
-                mime="text/csv"
-            )
+        csv_bytes = out_df[["row_id", "all_case_themes"]].to_csv(index=False).encode("utf-8")
+        st.download_button("Download themes CSV", data=csv_bytes,
+                           file_name="all_case_themes.csv", mime="text/csv")
+        st.info(f"Export ready. Source rows: {len(work)} • Labeled rows: {len(out_df)} (ordered by row_id).")
