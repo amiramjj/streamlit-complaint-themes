@@ -18,7 +18,7 @@ st.write("Key loaded:", "GOOGLE_API_KEY" in st.secrets)
 st.write("Model:", st.secrets.get("MODEL_NAME"))
 
 
-# ---------- Gemini test (single row) ----------
+# ---------- Gemini test (single row) with summarize-on-error fallback ----------
 import json
 import streamlit as st
 import google.generativeai as genai
@@ -47,70 +47,48 @@ sample_text = st.text_area(
 )
 go = st.button("Test Gemini")
 
-def call_gemini(system_instruction: str, complaint_text: str):
-    """
-    Expects STRICT JSON with:
-    {
-      "all_case_themes": [string, ...],
-      "subcategory_themes": [string, ...],
-      "evidence_spans": [{"quote": string}, ...]
-    }
-    """
+def _parse_resp(resp):
+    raw_text = getattr(resp, "text", None)
+    if not raw_text and getattr(resp, "candidates", None):
+        parts = resp.candidates[0].content.parts
+        raw_text = "".join(getattr(p, "text", "") for p in parts)
+    return raw_text or ""
+
+def call_gemini_extract(system_instruction: str, complaint_text: str):
+    """Primary extractor: expects three fields."""
     model = genai.GenerativeModel(
         model_name=MODEL_NAME,
         system_instruction=system_instruction
     )
-
     generation_config = {
         "response_mime_type": "application/json",
         "response_schema": {
             "type": "object",
             "properties": {
-                "all_case_themes": {
-                    "type": "array",
-                    "items": {"type": "string"}
-                },
-                "subcategory_themes": {
-                    "type": "array",
-                    "items": {"type": "string"}
-                },
+                "all_case_themes":    {"type": "array", "items": {"type": "string"}},
+                "subcategory_themes": {"type": "array", "items": {"type": "string"}},
                 "evidence_spans": {
                     "type": "array",
                     "items": {
                         "type": "object",
-                        "properties": {
-                            "quote": {"type": "string"}
-                        },
+                        "properties": {"quote": {"type": "string"}},
                         "required": ["quote"]
                     }
                 }
             },
             "required": ["all_case_themes", "subcategory_themes", "evidence_spans"]
-            # NOTE: don't add 'additionalProperties' — Gemini schemas don't support it
-        }
+        },
+        "max_output_tokens": 256,
+        "temperature": 0.2,
     }
-
     resp = model.generate_content(
         [{"role": "user", "parts": [f'complaint_summary: """{complaint_text}"""']}],
         generation_config=generation_config,
     )
+    raw = _parse_resp(resp)
+    data = json.loads(raw or "{}")
 
-    # Prefer resp.text; fall back to parts if needed
-    raw_text = getattr(resp, "text", None)
-    if not raw_text and getattr(resp, "candidates", None):
-        parts = resp.candidates[0].content.parts
-        raw_text = "".join(getattr(p, "text", "") for p in parts)
-
-    data = json.loads(raw_text or "{}")
-
-    # Normalize/guard: keep only the keys we care about and coerce shapes
-    out = {
-        "all_case_themes": data.get("all_case_themes", []) or [],
-        "subcategory_themes": data.get("subcategory_themes", []) or [],
-        "evidence_spans": []
-    }
-
-    # evidence_spans can be [{"quote": "..."}] or (rarely) ["..."]
+    # normalize
     spans = data.get("evidence_spans", []) or []
     norm_spans = []
     for s in spans:
@@ -118,23 +96,67 @@ def call_gemini(system_instruction: str, complaint_text: str):
             norm_spans.append({"quote": str(s["quote"])})
         elif isinstance(s, str):
             norm_spans.append({"quote": s})
-    out["evidence_spans"] = norm_spans
+    out = {
+        "all_case_themes": data.get("all_case_themes", []) or [],
+        "subcategory_themes": data.get("subcategory_themes", []) or [],
+        "evidence_spans": norm_spans,
+    }
+    return out, raw
 
-    return out, raw_text
+def call_gemini_summarize(complaint_text: str) -> str:
+    """Fallback: compress to core issues only, then we re-run extraction on the summary."""
+    model = genai.GenerativeModel(model_name=MODEL_NAME)
+    generation_config = {
+        "response_mime_type": "application/json",
+        "response_schema": {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+            "required": ["summary"]
+        },
+        "max_output_tokens": 200,
+        "temperature": 0.2,
+    }
+    # Minimal, deterministic summary prompt
+    summary_instruction = (
+        "Summarize this complaint_summary into 3–5 short bullets (one paragraph OK) "
+        "capturing ONLY substantive reasons/behaviors that could cause dissatisfaction or replacement. "
+        "Remove admin/process details (calls, links, scheduling, follow-ups), names, and dates. "
+        "Be concise and neutral."
+    )
+    resp = model.generate_content(
+        [
+            {"role": "user", "parts": [
+                summary_instruction + f'\n\ncomplaint_summary: """{complaint_text}"""'
+            ]}
+        ],
+        generation_config=generation_config,
+    )
+    raw = _parse_resp(resp)
+    data = json.loads(raw or "{}")
+    return data.get("summary", "").strip()
 
 if go:
     # remember inputs between reruns
     st.session_state["system_prompt"] = system_prompt
-    st.session_state["sample_text"] = sample_text
+    st.session_state["sample_text"]  = sample_text
 
     try:
-        out, raw = call_gemini(system_prompt.strip(), sample_text.strip())
+        out, raw = call_gemini_extract(system_prompt.strip(), sample_text.strip())
         st.success("Got JSON:")
         st.json(out)
-    except Exception as e:
-        st.error(f"Failed to parse JSON: {e}")
-        if 'raw' in locals() and raw:
-            st.code(raw)
+    except Exception as e1:
+        st.warning(f"Primary extraction failed ({e1}). Trying summarize-then-extract fallback…")
+        try:
+            summary = call_gemini_summarize(sample_text.strip())
+            if not summary:
+                raise RuntimeError("Summarizer returned empty text")
+            out2, raw2 = call_gemini_extract(system_prompt.strip(), summary)
+            st.success("Fallback succeeded on summarized text.")
+            with st.expander("Summary used for fallback"):
+                st.write(summary)
+            st.json(out2)
+        except Exception as e2:
+            st.error(f"Fallback also failed: {e2}")
 
 
 # ---------- Batch setup: upload & select column (robust) ----------
