@@ -1,5 +1,6 @@
 import streamlit as st
 import json, os
+import json
 import streamlit as st
 import google.generativeai as genai
 import io
@@ -18,10 +19,6 @@ st.write("Model:", st.secrets.get("MODEL_NAME"))
 
 
 # ---------- Gemini test (single row) ----------
-import json
-import streamlit as st
-import google.generativeai as genai
-
 st.header("Gemini test (single row)")
 
 # 1) Check secret
