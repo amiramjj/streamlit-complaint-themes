@@ -30,8 +30,16 @@ if "GOOGLE_API_KEY" not in st.secrets:
     st.error("No GOOGLE_API_KEY in Secrets. Add it in the app’s Settings → Secrets.")
     st.stop()
 
-# 2) Configure SDK
-genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+# 2) Configure SDK ---- API key selector (primary vs alt) ----
+key_choice = st.radio("API key to use", ["primary", "alt"], horizontal=True, key="api_key_choice")
+
+ACTIVE_API_KEY = (
+    st.secrets["GOOGLE_API_KEY"]
+    if key_choice == "primary"
+    else st.secrets.get("ALT_GOOGLE_API_KEY", st.secrets["GOOGLE_API_KEY"])
+)
+
+genai.configure(api_key=ACTIVE_API_KEY)
 MODEL_NAME = st.secrets.get("MODEL_NAME", "gemini-2.5-flash-lite")
 
 # 3) Inputs
@@ -45,6 +53,7 @@ sample_text = st.text_area(
     height=120,
     value=st.session_state.get("sample_text", "")
 )
+
 go = st.button("Test Gemini")
 
 def _parse_resp(resp):
